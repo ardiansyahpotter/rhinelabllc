@@ -233,6 +233,17 @@ textarea.form-control:focus {
     font-weight: 700;
 }
 
+.queue-number {
+    display: inline-block;
+    min-width: 3.5rem;
+    padding: 0.25rem 0.55rem;
+    border-radius: 6px;
+    background: #e0f2fe;
+    color: #075985;
+    text-align: center;
+    font-weight: 800;
+}
+
 .stats-grid,
 .grid-columns {
     display: grid;

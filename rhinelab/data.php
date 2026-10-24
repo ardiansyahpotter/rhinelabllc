@@ -58,11 +58,66 @@ function initialize_database($pdo) {
             phone VARCHAR(25) NOT NULL,
             doctor_id INT NOT NULL,
             schedule_id INT NOT NULL,
+                patient_profile_id INT NULL,
+                queue_number INT NULL,
             status VARCHAR(50) NOT NULL DEFAULT "Reservasi",
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_patients_schedule_queue (schedule_id, queue_number),
             FOREIGN KEY (doctor_id) REFERENCES doctors(id) ON DELETE CASCADE,
             FOREIGN KEY (schedule_id) REFERENCES schedules(id) ON DELETE CASCADE
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+
+            ensure_column($pdo, 'patients', 'patient_profile_id', 'INT NULL AFTER schedule_id');
+            ensure_column($pdo, 'patients', 'queue_number', 'INT NULL AFTER patient_profile_id');
+
+    ensure_table($pdo, 'patient_profiles', 'CREATE TABLE IF NOT EXISTS patient_profiles (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            nik VARCHAR(30) NOT NULL UNIQUE,
+            name VARCHAR(150) NOT NULL,
+            address TEXT NOT NULL,
+            phone VARCHAR(25) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+
+    ensure_table($pdo, 'medical_records', 'CREATE TABLE IF NOT EXISTS medical_records (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            patient_id INT NOT NULL,
+            doctor_id INT NULL,
+            visit_date DATE NOT NULL,
+            visit_time TIME NOT NULL,
+            queue_number INT NULL,
+            cupping_type VARCHAR(30) NOT NULL,
+            treatment TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_medical_records_patient_date (patient_id, visit_date),
+            FOREIGN KEY (patient_id) REFERENCES patient_profiles(id) ON DELETE CASCADE,
+            FOREIGN KEY (doctor_id) REFERENCES doctors(id) ON DELETE SET NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+
+    ensure_column($pdo, 'medical_records', 'queue_number', 'INT NULL AFTER visit_time');
+    $pdo->exec('UPDATE medical_records mr
+                INNER JOIN patients p ON p.patient_profile_id = mr.patient_id AND p.doctor_id = mr.doctor_id
+                INNER JOIN schedules s ON s.id = p.schedule_id AND s.date = mr.visit_date AND s.time = mr.visit_time
+                SET mr.queue_number = p.queue_number
+                WHERE mr.queue_number IS NULL AND p.queue_number IS NOT NULL');
+
+    $missingQueues = $pdo->query('SELECT id, schedule_id FROM patients WHERE queue_number IS NULL OR queue_number < 1 ORDER BY schedule_id, created_at, id')->fetchAll(PDO::FETCH_ASSOC);
+    if (!empty($missingQueues)) {
+        $queueNumbers = [];
+        $existingQueues = $pdo->query('SELECT schedule_id, COALESCE(MAX(queue_number), 0) AS max_queue FROM patients GROUP BY schedule_id')->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($existingQueues as $queue) {
+            $queueNumbers[(int)$queue['schedule_id']] = (int)$queue['max_queue'] + 1;
+        }
+        $updateQueue = $pdo->prepare('UPDATE patients SET queue_number = ? WHERE id = ?');
+        foreach ($missingQueues as $patient) {
+            $scheduleId = (int)$patient['schedule_id'];
+            $queueNumber = $queueNumbers[$scheduleId] ?? 1;
+            $updateQueue->execute([$queueNumber, (int)$patient['id']]);
+            $queueNumbers[$scheduleId] = $queueNumber + 1;
+        }
+    }
 
     ensure_table($pdo, 'doctor_holidays', 'CREATE TABLE IF NOT EXISTS doctor_holidays (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -170,10 +225,22 @@ function ensure_table($pdo, $tableName, $createSql) {
     }
 }
 
+function ensure_column($pdo, $tableName, $columnName, $definition) {
+    $check = $pdo->prepare('SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?');
+    $check->execute([DB_NAME, $tableName, $columnName]);
+    if ((int)$check->fetchColumn() === 0) {
+        $pdo->exec('ALTER TABLE `' . $tableName . '` ADD COLUMN `' . $columnName . '` ' . $definition);
+    }
+}
+
 function db_query($sql, $params = [], $one = false) {
     $stmt = db_connect()->prepare($sql);
     $stmt->execute($params);
     return $one ? $stmt->fetch() : $stmt->fetchAll();
+}
+
+function cleanup_expired_schedules() {
+    db_query('DELETE FROM schedules WHERE date < CURDATE()');
 }
 
 function load_data($name) {
@@ -181,6 +248,7 @@ function load_data($name) {
         case 'doctors':
             return db_query('SELECT * FROM doctors ORDER BY name');
         case 'schedules':
+            cleanup_expired_schedules();
             return db_query('SELECT * FROM schedules ORDER BY date, time');
         case 'patients':
             return db_query('SELECT * FROM patients ORDER BY created_at DESC');
@@ -189,6 +257,7 @@ function load_data($name) {
 }
 
 function load_doctor_schedules($doctorId) {
+    cleanup_expired_schedules();
     return db_query('SELECT * FROM schedules WHERE doctor_id = ? ORDER BY date, time', [(int)$doctorId]);
 }
 
@@ -272,11 +341,26 @@ function find_by_id($items, $id, $key = 'id') {
 }
 
 function get_schedule_by_id($scheduleId) {
+    cleanup_expired_schedules();
     return db_query('SELECT * FROM schedules WHERE id = ? LIMIT 1', [$scheduleId], true);
 }
 
 function get_doctor_by_id($doctorId) {
     return db_query('SELECT * FROM doctors WHERE id = ? LIMIT 1', [$doctorId], true);
+}
+
+function get_doctor_specialty($doctors, $id) {
+    // If $doctors is an array of doctor rows, try to find the matching one
+    if (is_array($doctors)) {
+        foreach ($doctors as $d) {
+            if ((string)$d['id'] === (string)$id) {
+                return $d['specialty'] ?? 'Umum';
+            }
+        }
+    }
+    // Fallback: query the DB directly
+    $row = get_doctor_by_id($id);
+    return $row ? ($row['specialty'] ?? 'Umum') : 'Umum';
 }
 
 function insert_doctor($name, $specialty, $phone, $description = '', $education = '', $symptoms = '') {
@@ -307,14 +391,172 @@ function insert_schedule($doctorId, $date, $time, $slots) {
     db_query('INSERT INTO schedules (doctor_id, date, time, slots) VALUES (?, ?, ?, ?)', [$doctorId, $date, $time, $slots]);
 }
 
+function delete_schedule_by_id($scheduleId) {
+    db_query('DELETE FROM schedules WHERE id = ?', [$scheduleId]);
+}
+
+/**
+ * Deduplicate schedules so that for each doctor and date only the latest
+ * created schedule is returned.
+ */
+function dedupe_latest_schedules($schedules) {
+    $map = [];
+    foreach ($schedules as $s) {
+        $key = $s['doctor_id'] . '|' . $s['date'];
+        if (!isset($map[$key])) {
+            $map[$key] = $s;
+            continue;
+        }
+        // Prefer the most recently created schedule (created_at) or higher id
+        $existing = $map[$key];
+        $existingTime = isset($existing['created_at']) ? strtotime($existing['created_at']) : 0;
+        $currentTime = isset($s['created_at']) ? strtotime($s['created_at']) : 0;
+        if ($currentTime > $existingTime) {
+            $map[$key] = $s;
+        } elseif ($currentTime == $existingTime && isset($s['id']) && isset($existing['id']) && $s['id'] > $existing['id']) {
+            $map[$key] = $s;
+        }
+    }
+    return array_values($map);
+}
+
 function insert_patient($name, $phone, $doctorId, $scheduleId) {
-    db_query('INSERT INTO patients (name, phone, doctor_id, schedule_id) VALUES (?, ?, ?, ?)', [$name, $phone, $doctorId, $scheduleId]);
+    $pdo = db_connect();
+    $pdo->beginTransaction();
+    try {
+        $booking = create_patient_booking_record($name, $phone, $doctorId, $scheduleId);
+        $pdo->commit();
+        return $booking['queue_number'];
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $e;
+    }
+}
+
+function insert_patient_visit($name, $nik, $address, $phone, $doctorId, $scheduleId, $cuppingType, $treatment = '') {
+    $pdo = db_connect();
+    $pdo->beginTransaction();
+
+    try {
+        $profile = db_query('SELECT id FROM patient_profiles WHERE nik = ? LIMIT 1', [$nik], true);
+        if ($profile) {
+            $patientId = (int)$profile['id'];
+            db_query('UPDATE patient_profiles SET name = ?, address = ?, phone = ? WHERE id = ?', [$name, $address, $phone, $patientId]);
+        } else {
+            db_query('INSERT INTO patient_profiles (nik, name, address, phone) VALUES (?, ?, ?, ?)', [$nik, $name, $address, $phone]);
+            $patientId = (int)$pdo->lastInsertId();
+        }
+
+        $booking = create_patient_booking_record($name, $phone, $doctorId, $scheduleId, $patientId);
+        $schedule = $booking['schedule'];
+        db_query(
+            'INSERT INTO medical_records (patient_id, doctor_id, visit_date, visit_time, queue_number, cupping_type, treatment) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            [$patientId, $doctorId, $schedule['date'], $schedule['time'], $booking['queue_number'], $cuppingType, $treatment]
+        );
+        $recordId = (int)$pdo->lastInsertId();
+        $pdo->commit();
+        return ['queue_number' => $booking['queue_number'], 'medical_record_id' => $recordId, 'patient_id' => $patientId];
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+        throw $e;
+    }
+}
+
+function create_patient_booking_record($name, $phone, $doctorId, $scheduleId, $patientProfileId = null) {
+    $pdo = db_connect();
+    $scheduleQuery = $pdo->prepare('SELECT * FROM schedules WHERE id = ? FOR UPDATE');
+    $scheduleQuery->execute([(int)$scheduleId]);
+    $schedule = $scheduleQuery->fetch(PDO::FETCH_ASSOC);
+    if (!$schedule) {
+        throw new RuntimeException('Jadwal tidak ditemukan.');
+    }
+
+    $bookingCount = db_query('SELECT COUNT(*) AS total FROM patients WHERE schedule_id = ?', [(int)$scheduleId], true);
+    if ((int)$bookingCount['total'] >= (int)$schedule['slots']) {
+        throw new RuntimeException('Jadwal sudah penuh.');
+    }
+
+    $nextQueue = db_query('SELECT COALESCE(MAX(queue_number), 0) + 1 AS next_number FROM patients WHERE schedule_id = ?', [(int)$scheduleId], true);
+    $queueNumber = (int)$nextQueue['next_number'];
+    db_query(
+        'INSERT INTO patients (name, phone, doctor_id, schedule_id, patient_profile_id, queue_number) VALUES (?, ?, ?, ?, ?, ?)',
+        [$name, $phone, (int)$schedule['doctor_id'], (int)$scheduleId, $patientProfileId, $queueNumber]
+    );
+
+    return ['queue_number' => $queueNumber, 'schedule' => $schedule];
+}
+
+function find_upcoming_patient_queues($nik, $phone) {
+    return db_query(
+        'SELECT p.id, p.queue_number, p.name, p.phone, s.date, s.time, d.name AS doctor_name
+         FROM patients p
+         INNER JOIN patient_profiles pp ON pp.id = p.patient_profile_id
+         INNER JOIN schedules s ON s.id = p.schedule_id
+         INNER JOIN doctors d ON d.id = p.doctor_id
+         WHERE pp.nik = ? AND p.phone = ? AND s.date >= CURDATE()
+         ORDER BY s.date, s.time, p.queue_number',
+        [$nik, $phone]
+    );
+}
+
+function load_medical_records($search = '') {
+    $sql = 'SELECT mr.*, pp.nik, pp.name AS patient_name, pp.address, pp.phone,
+                   d.name AS doctor_name,
+                                     (SELECT COUNT(*) FROM medical_records history
+                                        WHERE history.patient_id = mr.patient_id
+                                            AND (history.visit_date < mr.visit_date OR (history.visit_date = mr.visit_date AND history.id <= mr.id))) AS visit_count
+            FROM medical_records mr
+            INNER JOIN patient_profiles pp ON pp.id = mr.patient_id
+            LEFT JOIN doctors d ON d.id = mr.doctor_id';
+    $params = [];
+    if ($search !== '') {
+        $sql .= ' WHERE pp.nik LIKE ? OR pp.name LIKE ?';
+        $params = ['%' . $search . '%', '%' . $search . '%'];
+    }
+    $sql .= ' ORDER BY mr.visit_date DESC, mr.visit_time DESC, mr.id DESC';
+    return db_query($sql, $params);
+}
+
+function get_medical_record_by_id($recordId) {
+    return db_query(
+        'SELECT mr.*, pp.nik, pp.name AS patient_name, pp.address, pp.phone,
+                d.name AS doctor_name,
+                                (SELECT COUNT(*) FROM medical_records history
+                                 WHERE history.patient_id = mr.patient_id
+                                     AND (history.visit_date < mr.visit_date OR (history.visit_date = mr.visit_date AND history.id <= mr.id))) AS visit_count
+         FROM medical_records mr
+         INNER JOIN patient_profiles pp ON pp.id = mr.patient_id
+         LEFT JOIN doctors d ON d.id = mr.doctor_id
+         WHERE mr.id = ? LIMIT 1',
+        [(int)$recordId],
+        true
+    );
+}
+
+function update_medical_record($recordId, $name, $nik, $address, $phone, $cuppingType, $treatment) {
+    $record = get_medical_record_by_id($recordId);
+    if (!$record) {
+        return false;
+    }
+    db_query(
+        'UPDATE patient_profiles SET name = ?, nik = ?, address = ?, phone = ? WHERE id = ?',
+        [$name, $nik, $address, $phone, $record['patient_id']]
+    );
+    db_query(
+        'UPDATE medical_records SET cupping_type = ?, treatment = ? WHERE id = ?',
+        [$cuppingType, $treatment, (int)$recordId]
+    );
+    return true;
 }
 
 function count_bookings($patients, $scheduleId) {
     $count = 0;
     foreach ($patients as $patient) {
-        if ($patient['schedule_id'] === $scheduleId) {
+        if ((int)$patient['schedule_id'] === (int)$scheduleId) {
             $count++;
         }
     }

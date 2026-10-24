@@ -8,6 +8,9 @@ Cara menjalankan sistem klinik sederhana:
 3. Buka browser dan akses:
    http://localhost/klinik-sederhana/index.php
 
+Pengunjung dapat mendaftar melalui form reservasi di halaman utama. Nomor antrean
+ditampilkan setelah pendaftaran dan dapat dicek kembali dengan NIK serta nomor telepon.
+
 4. Halaman admin:
    http://localhost/klinik-sederhana/admin.php
 
@@ -32,6 +35,7 @@ File penting:
 - `config.php` — konfigurasi koneksi MySQL
 - `data.php` — lapisan data yang menghubungkan aplikasi ke database
 - `index.php` — halaman pasien
+- `rekam_medis.php` — pengelolaan rekam medis dan riwayat kunjungan
 - `admin.php` — halaman admin
 - `dokter.php` — halaman dokter
 - `assets/style.css` — gaya tampilan UI

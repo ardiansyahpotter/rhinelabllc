@@ -72,6 +72,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $messageType = 'error';
         }
     }
+    if ($action === 'delete_schedule') {
+        $scheduleId = intval($_POST['schedule_id'] ?? 0);
+        if ($scheduleId > 0) {
+            $schedule = get_schedule_by_id($scheduleId);
+            if ($schedule && intval($schedule['doctor_id']) === $doctorId) {
+                delete_schedule_by_id($scheduleId);
+                $message = 'Jadwal berhasil dihapus.';
+                $messageType = 'success';
+                $mySchedules = load_doctor_schedules($doctorId);
+                $schedules = load_data('schedules');
+            } else {
+                $message = 'Anda tidak memiliki izin menghapus jadwal ini.';
+                $messageType = 'error';
+            }
+        } else {
+            $message = 'Jadwal tidak valid.';
+            $messageType = 'error';
+        }
+    }
 }
 
 function format_date_indonesia($date) {
@@ -84,13 +103,25 @@ function get_doctor_name($doctors, $id) {
 }
 
 function get_appointments($schedules, $patients, $doctorId, $targetDate) {
-    $result = [];
+    // Collect matching schedules and pick the latest updated (created_at) per doctor/date
+    $matches = [];
     foreach ($schedules as $schedule) {
         if ($schedule['doctor_id'] != $doctorId || $schedule['date'] !== $targetDate) {
             continue;
         }
-        $result[] = $schedule;
+        $key = $schedule['doctor_id'] . '|' . $schedule['date'];
+        if (!isset($matches[$key])) {
+            $matches[$key] = $schedule;
+            continue;
+        }
+        $existing = $matches[$key];
+        $existingTime = isset($existing['created_at']) ? strtotime($existing['created_at']) : 0;
+        $currentTime = isset($schedule['created_at']) ? strtotime($schedule['created_at']) : 0;
+        if ($currentTime > $existingTime || (isset($schedule['id']) && isset($existing['id']) && $schedule['id'] > $existing['id'] && $currentTime == $existingTime)) {
+            $matches[$key] = $schedule;
+        }
     }
+    $result = array_values($matches);
     usort($result, function ($a, $b) {
         return strcmp($a['time'], $b['time']);
     });
@@ -98,9 +129,13 @@ function get_appointments($schedules, $patients, $doctorId, $targetDate) {
 }
 
 function get_patient_list($patients, $scheduleId) {
-    return array_values(array_filter($patients, function ($patient) use ($scheduleId) {
-        return $patient['schedule_id'] === $scheduleId;
+    $patientList = array_values(array_filter($patients, function ($patient) use ($scheduleId) {
+        return (int)$patient['schedule_id'] === (int)$scheduleId;
     }));
+    usort($patientList, function ($a, $b) {
+        return (int)$a['queue_number'] <=> (int)$b['queue_number'];
+    });
+    return $patientList;
 }
 
 $selectedDoctor = $doctorId ? find_by_id($doctors, $doctorId) : null;
@@ -128,9 +163,10 @@ for ($i = 0; $i < 4; $i++) {
             <p class="hero-text text-muted">Lihat pasien yang akan Anda periksa hari ini dan beberapa hari berikutnya.</p>
         </div>
         <nav class="nav gap-2">
-            <a class="nav-link px-3 py-2 rounded-3" href="index.php">Beranda</a>
+            <!-- <a class="nav-link px-3 py-2 rounded-3" href="index.php">Beranda</a> -->
             <a class="nav-link px-3 py-2 rounded-3" href="doctors.php">Profil Dokter</a>
             <a class="nav-link px-3 py-2 rounded-3 active" aria-current="page" href="dokter.php">Jadwal Dokter</a>
+            <a class="nav-link px-3 py-2 rounded-3" href="rekam_medis.php">Rekam Medis</a>
             <a class="nav-link px-3 py-2 rounded-3 text-danger fw-bold" href="logout.php">Logout</a>
         </nav>
     </header>
@@ -221,19 +257,6 @@ for ($i = 0; $i < 4; $i++) {
         </div>
     </div>
 
-    <div class="card shadow-sm mb-4">
-        <div class="card-body">
-            <h2 class="h5 mb-4">Pilih Dokter</h2>
-            <form method="get">
-                <input type="hidden" name="target_date" value="<?php echo $targetDate; ?>" />
-                <div class="mb-3">
-                    <label class="form-label">Dokter Aktif</label>
-                    <input class="form-control" type="text" value="<?php echo htmlspecialchars($selectedDoctor ? $selectedDoctor['name'] . ' - ' . $selectedDoctor['specialty'] : 'Dokter belum ditemukan'); ?>" readonly />
-                </div>
-                <button class="btn btn-outline-primary" type="submit" disabled>Lihat Jadwal</button>
-            </form>
-        </div>
-    </div>
 
     <div class="card shadow-sm mb-4">
         <div class="card-body">
@@ -248,6 +271,7 @@ for ($i = 0; $i < 4; $i++) {
                                 <th>Tanggal</th>
                                 <th>Jam</th>
                                 <th>Slot</th>
+                                <th>Aksi</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -256,6 +280,13 @@ for ($i = 0; $i < 4; $i++) {
                                     <td><?php echo format_date_indonesia($schedule['date']); ?></td>
                                     <td><?php echo substr($schedule['time'], 0, 5); ?></td>
                                     <td><?php echo (int)$schedule['slots']; ?></td>
+                                    <td>
+                                        <form method="post" class="d-inline" onsubmit="return confirm('Hapus jadwal ini?');">
+                                            <input type="hidden" name="action" value="delete_schedule" />
+                                            <input type="hidden" name="schedule_id" value="<?php echo $schedule['id']; ?>" />
+                                            <button class="btn btn-sm btn-outline-danger" type="submit">Hapus</button>
+                                        </form>
+                                    </td>
                                 </tr>
                             <?php endforeach; ?>
                         </tbody>
@@ -286,13 +317,22 @@ for ($i = 0; $i < 4; $i++) {
                     <?php else: ?>
                         <table class="table">
                             <thead>
-                                <tr><th>Jam</th><th>Calon Pasien</th><th>Status</th></tr>
+                                <tr><th>Jam</th><th>Antrean</th><th>Calon Pasien</th><th>Status</th></tr>
                             </thead>
                             <tbody>
                                 <?php foreach ($appointments as $schedule): ?>
                                     <?php $patientsForSchedule = get_patient_list($patients, $schedule['id']); ?>
                                     <tr>
                                         <td><?php echo substr($schedule['time'], 0, 5); ?></td>
+                                        <td>
+                                            <?php if (empty($patientsForSchedule)): ?>
+                                                <span class="muted">-</span>
+                                            <?php else: ?>
+                                                <?php foreach ($patientsForSchedule as $patient): ?>
+                                                    <div><?php if (!empty($patient['queue_number'])): ?><strong class="queue-number">#<?php echo (int)$patient['queue_number']; ?></strong><?php else: ?><span class="muted">-</span><?php endif; ?></div>
+                                                <?php endforeach; ?>
+                                            <?php endif; ?>
+                                        </td>
                                         <td>
                                             <?php if (empty($patientsForSchedule)): ?>
                                                 <span class="muted">Belum ada pasien</span>

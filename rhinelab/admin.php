@@ -16,6 +16,22 @@ $doctorHolidays = load_doctor_holidays();
 $message = '';
 $messageType = 'success';
 
+// Selected date for viewing schedules (from date picker)
+$selectedDate = isset($_GET['selected_date']) ? sanitize($_GET['selected_date']) : date('Y-m-d');
+
+// Schedules for the selected date
+$todaySchedules = array_values(array_filter($schedules, function ($schedule) use ($selectedDate) {
+    return $schedule['date'] === $selectedDate;
+}));
+usort($todaySchedules, function ($a, $b) {
+    return strcmp($a['time'], $b['time']);
+});
+// Keep only the latest schedule per doctor/date
+$todaySchedules = dedupe_latest_schedules($todaySchedules);
+
+$bookings = get_schedule_bookings($schedules, $patients);
+$doctorHolidaysForDate = get_doctor_holidays_for_date($selectedDate);
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
     if ($action === 'save_site_content') {
@@ -34,31 +50,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $siteContents = load_site_contents();
         $message = 'Konten halaman berhasil disimpan.';
         $messageType = 'success';
-    }
-    if ($action === 'save_admin_settings') {
-        $admin_phone = sanitize($_POST['admin_phone'] ?? '');
-        if ($admin_phone === '') {
-            $message = 'Nomor WhatsApp admin wajib diisi.';
-            $messageType = 'error';
-        } else {
-            upsert_admin_setting('admin_phone', $admin_phone);
-            $message = 'Pengaturan admin berhasil disimpan.';
-            $messageType = 'success';
-        }
-    }
-    if ($action === 'save_doctor_holiday') {
-        $holidayDoctorId = intval($_POST['holiday_doctor_id'] ?? 0);
-        $holidayDate = sanitize($_POST['holiday_date'] ?? '');
-        $holidayNote = trim($_POST['holiday_note'] ?? '');
-
-        if ($holidayDoctorId <= 0 || $holidayDate === '') {
-            $message = 'Pilih dokter dan tanggal libur yang valid.';
-            $messageType = 'error';
-        } else {
-            upsert_doctor_holiday($holidayDoctorId, $holidayDate, $holidayNote);
-            $message = 'Keterangan libur dokter berhasil disimpan.';
-            $messageType = 'success';
-        }
     }
     if ($action === 'delete_doctor_holiday') {
         $holidayDoctorId = intval($_POST['holiday_doctor_id'] ?? 0);
@@ -119,19 +110,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'add_patient') {
         $scheduleId = sanitize($_POST['schedule_id'] ?? '');
         $name = sanitize($_POST['patient_name'] ?? '');
+        $nik = preg_replace('/\D+/', '', $_POST['patient_nik'] ?? '');
+        $address = trim($_POST['patient_address'] ?? '');
         $phone = sanitize($_POST['patient_phone'] ?? '');
+        $cuppingType = sanitize($_POST['cupping_type'] ?? '');
         $schedule = get_schedule_by_id($scheduleId);
-        if ($schedule === null || $name === '' || $phone === '') {
+        if ($schedule === null || $name === '' || $nik === '' || $address === '' || $phone === '' || !in_array($cuppingType, ['Bekam kering', 'Bekam basah', 'Sinanti'], true)) {
             $message = 'Lengkapi data pasien dan pilih jadwal yang valid.';
             $messageType = 'error';
         } else {
-            $booked = count_bookings($patients, $scheduleId);
+            $booked = count_bookings($patients, (int)$scheduleId);
             if ($booked >= $schedule['slots']) {
                 $message = 'Jadwal sudah penuh dan tidak bisa ditambahkan pasien baru.';
                 $messageType = 'error';
             } else {
-                insert_patient($name, $phone, $schedule['doctor_id'], $scheduleId);
-                $message = 'Calon pasien berhasil ditambahkan ke jadwal.';
+                try {
+                    insert_patient_visit($name, $nik, $address, $phone, $schedule['doctor_id'], $scheduleId, $cuppingType);
+                    $message = 'Pasien berhasil ditambahkan ke jadwal dan rekam medis.';
+                } catch (Throwable $e) {
+                    $message = 'Pasien gagal ditambahkan. Periksa NIK dan ketersediaan jadwal.';
+                    $messageType = 'error';
+                }
             }
         }
     }
@@ -180,6 +179,7 @@ function get_doctor_name($doctors, $id) {
             <a class="nav-link px-3 py-2 rounded-3" href="index.php">Beranda</a>
             <a class="nav-link px-3 py-2 rounded-3" href="doctors.php">Profil Dokter</a>
             <a class="nav-link px-3 py-2 rounded-3 active" aria-current="page" href="admin.php">Admin</a>
+            <a class="nav-link px-3 py-2 rounded-3" href="rekam_medis.php">Rekam Medis</a>
             <a class="nav-link px-3 py-2 rounded-3 text-danger fw-bold" href="logout.php">Logout</a>
         </nav>
     </header>
@@ -194,6 +194,62 @@ function get_doctor_name($doctors, $id) {
             <input type="text" id="scheduleCalendar" class="form-control" placeholder="Pilih tanggal untuk melihat jadwal..." readonly />
         </div>
     </div>
+
+        <section id="adminJadwal" class="card shadow-sm mb-4">
+            <div class="card-body">
+                <h2 class="h5 mb-3">Jadwal Dokter pada <?php echo format_date_indonesia($selectedDate); ?></h2>
+                <?php if (!empty($doctorHolidaysForDate)): ?>
+                    <div class="alert alert-warning">
+                        <strong>Catatan libur hari ini:</strong>
+                        <ul class="mb-0 mt-2">
+                            <?php foreach ($doctorHolidaysForDate as $holiday): ?>
+                                <li><?php echo htmlspecialchars(get_doctor_name($doctors, $holiday['doctor_id'])); ?> - <?php echo htmlspecialchars($holiday['note']); ?></li>
+                            <?php endforeach; ?>
+                        </ul>
+                    </div>
+                <?php endif; ?>
+
+                <?php if (empty($todaySchedules)): ?>
+                    <p class="muted">Belum ada jadwal dokter untuk tanggal ini.</p>
+                <?php else: ?>
+                    <div class="table-responsive">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th>Dokter</th>
+                                    <th>Spesialisasi</th>
+                                    <th>Jam Praktik</th>
+                                    <th>Menerima pasien</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <?php foreach ($todaySchedules as $schedule): ?>
+                                    <?php
+                                    $booked = $bookings[$schedule['id']] ?? 0;
+                                    $holiday = $doctorHolidaysForDate[$schedule['doctor_id']] ?? null;
+                                    $holidayNote = $holiday ? $holiday['note'] : '';
+                                    $isFull = $booked >= $schedule['slots'];
+                                    $isBlocked = $holiday !== null;
+                                    ?>
+                                    <tr>
+                                        <td><?php echo get_doctor_name($doctors, $schedule['doctor_id']); ?></td>
+                                        <td><?php echo htmlspecialchars($schedule['specialty'] ?? get_doctor_specialty($doctors, $schedule['doctor_id'])); ?></td>
+                                        <td><?php echo substr($schedule['time'], 0, 5); ?></td>
+                                        <td>
+                                            <?php if ($isBlocked): ?>
+                                                <span class="status-full">Libur</span> - <?php echo htmlspecialchars($holidayNote !== '' ? $holidayNote : 'Dokter sedang libur'); ?>
+                                            <?php else: ?>
+                                                <?php echo $isFull ? '<span class="status-full">Penuh</span>' : '<span class="status-free">Tersedia</span>'; ?> (<?php echo $booked; ?>/<?php echo $schedule['slots']; ?>)
+                                            <?php endif; ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                <?php endif; ?>
+            </div>
+        </section>
 
     <div class="card shadow-sm mb-4">
         <div class="card-body">
@@ -434,8 +490,25 @@ function get_doctor_name($doctors, $id) {
                         <input class="form-control" type="text" name="patient_name" required />
                     </div>
                     <div class="col-md-6">
+                        <label class="form-label">Nomor KTP / NIK</label>
+                        <input class="form-control" type="text" name="patient_nik" inputmode="numeric" maxlength="30" required />
+                    </div>
+                    <div class="col-12">
+                        <label class="form-label">Alamat</label>
+                        <textarea class="form-control" name="patient_address" rows="2" required></textarea>
+                    </div>
+                    <div class="col-md-6">
                         <label class="form-label">Nomor Telepon</label>
                         <input class="form-control" type="text" name="patient_phone" required />
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label">Jenis Bekam</label>
+                        <select class="form-select" name="cupping_type" required>
+                            <option value="">Pilih jenis bekam</option>
+                            <option>Bekam kering</option>
+                            <option>Bekam basah</option>
+                            <option>Sinanti</option>
+                        </select>
                     </div>
                     <div class="col-12">
                         <label class="form-label">Jadwal Pilihan</label>
@@ -495,8 +568,9 @@ function get_doctor_name($doctors, $id) {
         <?php endif; ?>
     </div>
 
-    <div class="card">
+    <div class="card" id="daftarJadwal">
         <h2>Daftar Jadwal</h2>
+        <p class="muted mb-3">Jadwal yang sudah melewati tanggalnya akan terhapus otomatis.</p>
         <?php if (empty($schedules)): ?>
             <p class="muted">Belum ada jadwal dokter.</p>
         <?php else: ?>
@@ -526,12 +600,13 @@ function get_doctor_name($doctors, $id) {
         <?php else: ?>
             <table class="table">
                 <thead>
-                    <tr><th>Nama</th><th>Telepon</th><th>Dokter</th><th>Jadwal</th><th>Status</th></tr>
+                    <tr><th>Antrean</th><th>Nama</th><th>Telepon</th><th>Dokter</th><th>Jadwal</th><th>Status</th></tr>
                 </thead>
                 <tbody>
                     <?php foreach ($patients as $patient): ?>
                         <?php $schedule = find_by_id($schedules, $patient['schedule_id']); ?>
                         <tr>
+                            <td><?php if (!empty($patient['queue_number'])): ?><strong class="queue-number">#<?php echo (int)$patient['queue_number']; ?></strong><?php else: ?><span class="muted">-</span><?php endif; ?></td>
                             <td><?php echo $patient['name']; ?></td>
                             <td><?php echo $patient['phone']; ?></td>
                             <td><?php echo get_doctor_name($doctors, $patient['doctor_id']); ?></td>
@@ -556,16 +631,17 @@ function get_doctor_name($doctors, $id) {
     
     flatpickr('#scheduleCalendar', {
         mode: 'single',
-        defaultDate: today,
+        defaultDate: '<?php echo $selectedDate; ?>',
         onChange: function(selectedDates) {
             if (selectedDates.length > 0) {
                 const formattedDate = selectedDates[0].toISOString().split('T')[0];
-                const dayDifference = Math.floor((selectedDates[0] - today) / (1000 * 60 * 60 * 24));
-                window.location.href = 'admin.php?day=' + dayDifference;
+                // Navigate to the page and include the daftarJadwal anchor so the page scrolls after load
+                window.location.href = 'admin.php?selected_date=' + formattedDate + '#daftarJadwal';
             }
         },
         onDayCreate: function(dObj, dStr, fp, dayElem) {
             const dateStr = dayElem.dateObj.toISOString().split('T')[0];
+            const scheduledDates = <?php echo json_encode(array_values(array_unique(array_column($schedules, 'date')))); ?>;
             if (scheduledDates.includes(dateStr)) {
                 dayElem.classList.add('has-schedule');
             }
@@ -591,6 +667,18 @@ function get_doctor_name($doctors, $id) {
         
         document.getElementById('doctorFormFields').style.display = 'grid';
     }
+
+    // If the page was opened with a hash (e.g. #daftarJadwal), scroll to that section after load
+    document.addEventListener('DOMContentLoaded', function() {
+        var hash = window.location.hash || '';
+        if (hash.length > 1) {
+            var id = hash.substring(1);
+            var el = document.getElementById(id);
+            if (el) {
+                setTimeout(function() { el.scrollIntoView({behavior: 'smooth', block: 'start'}); }, 150);
+            }
+        }
+    });
 </script>
 </body>
 </html>

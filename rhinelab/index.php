@@ -1,8 +1,65 @@
 <?php
+session_start();
 require_once __DIR__ . '/data.php';
 
 $dayOffset = max(0, isset($_GET['day']) ? intval($_GET['day']) : 0);
 $selectedDate = date('Y-m-d', strtotime("+$dayOffset days"));
+$selectedScheduleId = (int)($_GET['schedule_id'] ?? 0);
+$bookingMessage = '';
+$bookingMessageType = 'error';
+$queueResults = [];
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (($_POST['action'] ?? '') === 'public_booking') {
+        $patientName = trim($_POST['patient_name'] ?? '');
+        $patientNik = preg_replace('/\D+/', '', $_POST['patient_nik'] ?? '');
+        $patientAddress = trim($_POST['patient_address'] ?? '');
+        $patientPhone = trim($_POST['patient_phone'] ?? '');
+        $cuppingType = trim($_POST['cupping_type'] ?? '');
+        $scheduleId = (int)($_POST['schedule_id'] ?? 0);
+        $schedule = $scheduleId > 0 ? get_schedule_by_id($scheduleId) : null;
+        $validCuppingTypes = ['Bekam kering', 'Bekam basah', 'Sinanti'];
+
+        if (!$schedule || $patientName === '' || $patientNik === '' || $patientAddress === '' || $patientPhone === '' || !in_array($cuppingType, $validCuppingTypes, true)) {
+            $bookingMessage = 'Lengkapi identitas, jenis bekam, dan pilih jadwal yang tersedia.';
+        } elseif ($schedule['date'] < date('Y-m-d') || get_doctor_holiday($schedule['doctor_id'], $schedule['date'])) {
+            $bookingMessage = 'Jadwal tersebut sudah lewat atau dokter sedang libur.';
+        } else {
+            try {
+                $booking = insert_patient_visit($patientName, $patientNik, $patientAddress, $patientPhone, (int)$schedule['doctor_id'], $scheduleId, $cuppingType);
+                $_SESSION['queue_confirmation'] = [
+                    'name' => $patientName,
+                    'queue_number' => $booking['queue_number'],
+                    'date' => $schedule['date'],
+                    'time' => $schedule['time'],
+                    'doctor' => get_doctor_name(load_data('doctors'), $schedule['doctor_id'])
+                ];
+                header('Location: index.php?day=' . $dayOffset . '#reservasi');
+                exit;
+            } catch (Throwable $e) {
+                $bookingMessage = $e->getMessage() === 'Jadwal sudah penuh.'
+                    ? 'Jadwal sudah penuh. Silakan pilih jadwal lain.'
+                    : 'Reservasi gagal disimpan. Periksa data dan coba kembali.';
+            }
+        }
+    } elseif (($_POST['action'] ?? '') === 'lookup_queue') {
+        $lookupNik = preg_replace('/\D+/', '', $_POST['lookup_nik'] ?? '');
+        $lookupPhone = trim($_POST['lookup_phone'] ?? '');
+        if ($lookupNik === '' || $lookupPhone === '') {
+            $bookingMessage = 'Masukkan NIK dan nomor telepon yang digunakan saat reservasi.';
+        } else {
+            $queueResults = find_upcoming_patient_queues($lookupNik, $lookupPhone);
+            if (empty($queueResults)) {
+                $bookingMessage = 'Tidak ditemukan antrean mendatang untuk kombinasi NIK dan nomor telepon tersebut.';
+            } else {
+                $bookingMessageType = 'success';
+            }
+        }
+    }
+}
+
+$queueConfirmation = $_SESSION['queue_confirmation'] ?? null;
+unset($_SESSION['queue_confirmation']);
 
 $doctors = load_data('doctors');
 $schedules = load_data('schedules');
@@ -10,15 +67,22 @@ $patients = load_data('patients');
 $siteContents = load_site_contents();
 $doctorHolidays = get_doctor_holidays_for_date($selectedDate);
 $bookings = get_schedule_bookings($schedules, $patients);
+$allHolidays = load_doctor_holidays();
+$holidayKeys = [];
+foreach ($allHolidays as $holiday) {
+    $holidayKeys[(int)$holiday['doctor_id'] . '|' . $holiday['holiday_date']] = true;
+}
+$bookableSchedules = array_values(array_filter($schedules, function ($schedule) use ($bookings, $holidayKeys) {
+    $key = (int)$schedule['doctor_id'] . '|' . $schedule['date'];
+    return $schedule['date'] >= date('Y-m-d')
+        && ($bookings[$schedule['id']] ?? 0) < (int)$schedule['slots']
+        && !isset($holidayKeys[$key]);
+}));
+$bookableSchedules = dedupe_latest_schedules($bookableSchedules);
 
 function get_doctor_name($doctors, $id) {
     $doctor = find_by_id($doctors, $id);
     return $doctor ? $doctor['name'] : 'Dokter tidak ditemukan';
-}
-
-function get_doctor_specialty($doctors, $id) {
-    $doctor = find_by_id($doctors, $id);
-    return $doctor ? $doctor['specialty'] : 'Umum';
 }
 
 function format_date_indonesia($date) {
@@ -32,6 +96,9 @@ $todaySchedules = array_values(array_filter($schedules, function ($schedule) use
 usort($todaySchedules, function ($a, $b) {
     return strcmp($a['time'], $b['time']);
 });
+
+// Deduplicate schedules so each doctor/date pair keeps only the latest entry
+$todaySchedules = dedupe_latest_schedules($todaySchedules);
 
 $availableCount = 0;
 foreach ($todaySchedules as $schedule) {
@@ -94,7 +161,7 @@ foreach ($todaySchedules as $schedule) {
                         </div>
                         <div class="col-12">
                             <div class="p-3 bg-white rounded-4 shadow-sm text-center">
-                                <p class="mb-1 text-secondary small">Slot Tersedia</p>
+                                <p class="mb-1 text-secondary small">Sisa Tersedia</p>
                                 <h3 class="h2 mb-0"><?php echo $availableCount; ?></h3>
                             </div>
                         </div>
@@ -125,6 +192,7 @@ foreach ($todaySchedules as $schedule) {
 
     <section id="jadwal" class="card">
         <h2>Jadwal Dokter pada <?php echo format_date_indonesia($selectedDate); ?></h2>
+        <!-- <p class="muted mb-3">Jadwal juga akan terhapus apabila sudah melewati tanggal.</p> -->
         <?php if (!empty($doctorHolidays)): ?>
             <div class="alert alert-warning">
                 <strong>Catatan libur hari ini:</strong>
@@ -143,9 +211,9 @@ foreach ($todaySchedules as $schedule) {
                     <tr>
                         <th>Dokter</th>
                         <th>Spesialisasi</th>
-                        <th>Jam</th>
-                        <th>Status</th>
-                        <th>Aksi</th>
+                        <th>Jam Praktik</th>
+                        <th>Menerima pasien</th>
+                        <th>Reservasi / Antrean</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -166,7 +234,7 @@ foreach ($todaySchedules as $schedule) {
                                 <?php if ($isBlocked): ?>
                                     <span class="status-full">Libur</span> - <?php echo htmlspecialchars($holidayNote !== '' ? $holidayNote : 'Dokter sedang libur'); ?>
                                 <?php else: ?>
-                                    <?php echo $isFull ? '<span class="status-full">Penuh</span>' : '<span class="status-free">Tersedia</span>'; ?> (<?php echo $booked; ?>/<?php echo $schedule['slots']; ?>)
+                                    <?php echo $isFull ? '<span class="status-full">Penuh</span>' : '<span class="status-free">Sisa Tersedia</span>'; ?> (<?php echo $booked; ?>/<?php echo $schedule['slots']; ?>)
                                 <?php endif; ?>
                             </td>
                             <td>
@@ -175,7 +243,8 @@ foreach ($todaySchedules as $schedule) {
                                 <?php elseif ($isFull): ?>
                                     <span class="muted">Reservasi ditutup</span>
                                 <?php else: ?>
-                                    <a class="btn btn-success btn-sm" href="https://wa.me/<?php echo ADMIN_PHONE; ?>?text=<?php echo $whatsappText; ?>" target="_blank">Reservasi via WhatsApp</a>
+                                    <a class="btn btn-success btn-sm" href="index.php?day=<?php echo $dayOffset; ?>&amp;schedule_id=<?php echo (int)$schedule['id']; ?>#reservasi">Daftar dan ambil antrean</a>
+                                    <a class="btn btn-outline-secondary btn-sm mt-1" href="https://wa.me/<?php echo ADMIN_PHONE; ?>?text=<?php echo $whatsappText; ?>" target="_blank">WhatsApp</a>
                                 <?php endif; ?>
                             </td>
                         </tr>
@@ -183,6 +252,95 @@ foreach ($todaySchedules as $schedule) {
                 </tbody>
             </table>
         <?php endif; ?>
+    </section>
+
+    <section id="reservasi" class="card shadow-sm mb-4">
+        <div class="card-body">
+            <h2 class="h5 mb-3">Reservasi dan Nomor Antrean</h2>
+            <p class="text-muted">Isi data untuk mendaftar. Nomor antrean diberikan sesuai urutan pendaftaran pada jadwal yang dipilih.</p>
+            <?php if ($bookingMessage): ?>
+                <div class="alert alert-<?php echo $bookingMessageType === 'success' ? 'success' : 'danger'; ?>" role="alert"><?php echo htmlspecialchars($bookingMessage); ?></div>
+            <?php endif; ?>
+            <?php if ($queueConfirmation): ?>
+                <div class="alert alert-success queue-ticket" role="status">
+                    <h3 class="h5">Reservasi berhasil</h3>
+                    <p class="mb-1">Pasien: <strong><?php echo htmlspecialchars($queueConfirmation['name']); ?></strong></p>
+                    <p class="mb-1">Nomor antrean: <strong class="queue-number">#<?php echo (int)$queueConfirmation['queue_number']; ?></strong></p>
+                    <p class="mb-0"><?php echo htmlspecialchars(date('d-m-Y', strtotime($queueConfirmation['date'])) . ' pukul ' . substr($queueConfirmation['time'], 0, 5) . ' dengan ' . $queueConfirmation['doctor']); ?></p>
+                </div>
+            <?php endif; ?>
+            <form method="post" class="row g-3">
+                <input type="hidden" name="action" value="public_booking" />
+                <div class="col-md-6">
+                    <label class="form-label" for="patientName">Nama pasien</label>
+                    <input class="form-control" id="patientName" name="patient_name" maxlength="150" required />
+                </div>
+                <div class="col-md-6">
+                    <label class="form-label" for="patientNik">Nomor KTP / NIK</label>
+                    <input class="form-control" id="patientNik" name="patient_nik" inputmode="numeric" maxlength="30" required />
+                </div>
+                <div class="col-md-6">
+                    <label class="form-label" for="patientPhone">Nomor telepon</label>
+                    <input class="form-control" id="patientPhone" name="patient_phone" type="tel" maxlength="25" required />
+                </div>
+                <div class="col-md-6">
+                    <label class="form-label" for="patientAddress">Alamat</label>
+                    <input class="form-control" id="patientAddress" name="patient_address" maxlength="1000" required />
+                </div>
+                <div class="col-md-6">
+                    <label class="form-label" for="scheduleId">Jadwal dokter</label>
+                    <select class="form-select" id="scheduleId" name="schedule_id" required>
+                        <option value="">Pilih tanggal dan jam</option>
+                        <?php foreach ($bookableSchedules as $schedule): ?>
+                            <?php $scheduleDoctor = get_doctor_name($doctors, $schedule['doctor_id']); ?>
+                            <option value="<?php echo (int)$schedule['id']; ?>" <?php echo $selectedScheduleId === (int)$schedule['id'] ? 'selected' : ''; ?>>
+                                <?php echo htmlspecialchars(date('d-m-Y', strtotime($schedule['date'])) . ' ' . substr($schedule['time'], 0, 5) . ' - ' . $scheduleDoctor); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="col-md-6">
+                    <label class="form-label" for="cuppingType">Jenis bekam</label>
+                    <select class="form-select" id="cuppingType" name="cupping_type" required>
+                        <option value="">Pilih jenis bekam</option>
+                        <option>Bekam kering</option>
+                        <option>Bekam basah</option>
+                        <option>Sinanti</option>
+                    </select>
+                </div>
+                <div class="col-12"><button class="btn btn-primary" type="submit">Daftar dan dapatkan nomor antrean</button></div>
+            </form>
+        </div>
+    </section>
+
+    <section class="card shadow-sm mb-4">
+        <div class="card-body">
+            <h2 class="h5 mb-3">Cek Nomor Antrean</h2>
+            <p class="text-muted">Gunakan NIK dan nomor telepon yang sama seperti saat mendaftar.</p>
+            <form method="post" class="row g-3 mb-3">
+                <input type="hidden" name="action" value="lookup_queue" />
+                <div class="col-md-5"><label class="form-label" for="lookupNik">Nomor KTP / NIK</label><input class="form-control" id="lookupNik" name="lookup_nik" inputmode="numeric" required /></div>
+                <div class="col-md-5"><label class="form-label" for="lookupPhone">Nomor telepon</label><input class="form-control" id="lookupPhone" name="lookup_phone" type="tel" required /></div>
+                <div class="col-md-2 d-flex align-items-end"><button class="btn btn-outline-primary w-100" type="submit">Cari antrean</button></div>
+            </form>
+            <?php if (!empty($queueResults)): ?>
+                <div class="table-responsive">
+                    <table class="table align-middle mb-0">
+                        <thead><tr><th>Nomor antrean</th><th>Tanggal / Jam</th><th>Dokter</th><th>Pasien</th></tr></thead>
+                        <tbody>
+                            <?php foreach ($queueResults as $queue): ?>
+                                <tr>
+                                    <td><strong class="queue-number">#<?php echo (int)$queue['queue_number']; ?></strong></td>
+                                    <td><?php echo htmlspecialchars(date('d-m-Y', strtotime($queue['date'])) . ' ' . substr($queue['time'], 0, 5)); ?></td>
+                                    <td><?php echo htmlspecialchars($queue['doctor_name']); ?></td>
+                                    <td><?php echo htmlspecialchars($queue['name']); ?></td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </div>
+            <?php endif; ?>
+        </div>
     </section>
 
     <section class="card schedule-nav shadow-sm p-4 mb-4">
